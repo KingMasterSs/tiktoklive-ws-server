@@ -25,6 +25,19 @@ def extract_username(user_obj) -> str:
     )
 
 
+def extract_viewer_count_from_room_event(event: RoomUserSeqEvent) -> int | None:
+    candidates = [
+        getattr(event, "viewer_count", None),
+        getattr(event, "viewerCount", None),
+        getattr(event, "total_user", None),
+        getattr(event, "totalUser", None),
+    ]
+    for val in candidates:
+        if isinstance(val, int) and val >= 0:
+            return val
+    return None
+
+
 async def send_json(ws, payload: dict):
     try:
         await ws.send(json.dumps(payload, ensure_ascii=False))
@@ -79,9 +92,9 @@ async def listen_tiktok_room(ws, username: str):
     @client.on(RoomUserSeqEvent)
     async def on_room_stats(event: RoomUserSeqEvent):
         nonlocal viewer_count
-        count = getattr(event, "viewer_count", None)
-        if isinstance(count, int) and count >= 0:
-            viewer_count = count
+        found = extract_viewer_count_from_room_event(event)
+        if found is not None:
+            viewer_count = found
             await push_stats()
 
     @client.on(CommentEvent)
@@ -258,4 +271,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
