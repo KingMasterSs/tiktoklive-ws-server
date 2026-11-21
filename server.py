@@ -3,7 +3,25 @@ import json
 import os
 import websockets
 from TikTokLive import TikTokLiveClient
-from TikTokLive.events import CommentEvent, ConnectEvent, DisconnectEvent, RoomUserSeqEvent
+from TikTokLive.events import (
+    CommentEvent,
+    ConnectEvent,
+    DisconnectEvent,
+    GiftEvent,
+    JoinEvent,
+    LikeEvent,
+    RoomUserSeqEvent,
+)
+
+
+def extract_username(user_obj) -> str:
+    if not user_obj:
+        return "bilinmeyen"
+    return (
+        getattr(user_obj, "unique_id", None)
+        or getattr(user_obj, "nickname", None)
+        or "bilinmeyen"
+    )
 
 
 async def send_json(ws, payload: dict):
@@ -15,7 +33,10 @@ async def send_json(ws, payload: dict):
 
 async def listen_tiktok_room(ws, username: str):
     client = TikTokLiveClient(unique_id=username)
+
     comment_count = 0
+    gift_count = 0
+    like_count = 0
     viewer_count: int | None = None
 
     async def push_stats():
@@ -23,14 +44,16 @@ async def listen_tiktok_room(ws, username: str):
             "type": "stats",
             "username": username,
             "commentCount": comment_count,
-            "viewerCount": viewer_count
+            "giftCount": gift_count,
+            "likeCount": like_count,
+            "viewerCount": viewer_count,
         })
 
     @client.on(ConnectEvent)
     async def on_connect(event: ConnectEvent):
         await send_json(ws, {
             "type": "status",
-            "message": f"@{username} yayınına bağlandı, yorumlar dinleniyor..."
+            "message": f"@{username} yayınına bağlandı, tüm olaylar dinleniyor...",
         })
         await push_stats()
 
@@ -38,14 +61,14 @@ async def listen_tiktok_room(ws, username: str):
     async def on_disconnect(event: DisconnectEvent):
         await send_json(ws, {
             "type": "status",
-            "message": f"@{username} yayın bağlantısı kapandı."
+            "message": f"@{username} yayın bağlantısı kapandı.",
         })
 
     @client.on(RoomUserSeqEvent)
     async def on_room_stats(event: RoomUserSeqEvent):
         nonlocal viewer_count
         count = getattr(event, "viewer_count", None)
-        if isinstance(count, int):
+        if isinstance(count, int) and count >= 0:
             viewer_count = count
             await push_stats()
 
@@ -56,36 +79,89 @@ async def listen_tiktok_room(ws, username: str):
         if not comment_text:
             return
 
-        user_name = (
-            getattr(event.user, "unique_id", None)
-            or getattr(event.user, "nickname", None)
-            or "bilinmeyen"
-        )
+        user_name = extract_username(getattr(event, "user", None))
         comment_count += 1
 
         await send_json(ws, {
             "type": "chat",
             "user": str(user_name),
-            "comment": comment_text
+            "comment": comment_text,
         })
         await push_stats()
+
+    @client.on(GiftEvent)
+    async def on_gift(event: GiftEvent):
+        nonlocal gift_count
+        # Seri hediyelerde (streak) yalnızca tamamlandığında saymak isterseniz:
+        repeat_end = getattr(event, "repeat_end", None)
+        streakable = bool(getattr(getattr(event, "gift", None), "streakable", False))
+        if streakable and repeat_end is False:
+            return
+
+        user_name = extract_username(getattr(event, "user", None))
+        repeat_count = getattr(event, "repeat_count", None)
+        count = repeat_count if isinstance(repeat_count, int) and repeat_count > 0 else 1
+
+        gift_obj = getattr(event, "gift", None)
+        gift_name = (
+            getattr(gift_obj, "name", None)
+            or getattr(event, "gift_name", None)
+            or "Hediye"
+        )
+        diamonds = getattr(gift_obj, "diamond_count", None)
+
+        gift_count += count
+        await send_json(ws, {
+            "type": "gift",
+            "user": str(user_name),
+            "giftName": str(gift_name),
+            "count": count,
+            "diamonds": diamonds if isinstance(diamonds, int) else None,
+        })
+        await push_stats()
+
+    @client.on(LikeEvent)
+    async def on_like(event: LikeEvent):
+        nonlocal like_count
+        user_name = extract_username(getattr(event, "user", None))
+        raw_count = getattr(event, "count", None)
+        added = raw_count if isinstance(raw_count, int) and raw_count > 0 else 1
+
+        like_count += added
+        total_room_likes = getattr(event, "total_like_count", None)
+
+        await send_json(ws, {
+            "type": "like",
+            "user": str(user_name),
+            "count": added,
+            "totalLikes": total_room_likes if isinstance(total_room_likes, int) else like_count,
+        })
+        await push_stats()
+
+    @client.on(JoinEvent)
+    async def on_join(event: JoinEvent):
+        user_name = extract_username(getattr(event, "user", None))
+        await send_json(ws, {
+            "type": "join",
+            "user": str(user_name),
+        })
 
     try:
         await send_json(ws, {
             "type": "status",
-            "message": f"@{username} canlı yayınına bağlanılıyor..."
+            "message": f"@{username} canlı yayınına bağlanılıyor...",
         })
         await client.start()
     except asyncio.CancelledError:
         await send_json(ws, {
             "type": "status",
-            "message": f"@{username} dinlemesi durduruldu."
+            "message": f"@{username} dinlemesi durduruldu.",
         })
         raise
     except Exception as e:
         await send_json(ws, {
             "type": "error",
-            "message": f"TikTok bağlantısı başarısız: {str(e)}"
+            "message": f"TikTok bağlantısı başarısız: {str(e)}",
         })
     finally:
         try:
@@ -114,7 +190,7 @@ async def ws_handler(websocket):
             except Exception:
                 await send_json(websocket, {
                     "type": "error",
-                    "message": "Geçersiz JSON mesajı."
+                    "message": "Geçersiz JSON mesajı.",
                 })
                 continue
 
@@ -125,7 +201,7 @@ async def ws_handler(websocket):
                 if not username:
                     await send_json(websocket, {
                         "type": "error",
-                        "message": "Kullanıcı adı boş olamaz."
+                        "message": "Kullanıcı adı boş olamaz.",
                     })
                     continue
 
@@ -136,13 +212,13 @@ async def ws_handler(websocket):
                 await cancel_current_task()
                 await send_json(websocket, {
                     "type": "status",
-                    "message": "Dinleme durduruldu."
+                    "message": "Dinleme durduruldu.",
                 })
 
             else:
                 await send_json(websocket, {
                     "type": "error",
-                    "message": f"Bilinmeyen işlem: {action}"
+                    "message": f"Bilinmeyen işlem: {action}",
                 })
     except websockets.exceptions.ConnectionClosed:
         pass
@@ -159,4 +235,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+                        
