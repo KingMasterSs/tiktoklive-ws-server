@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 import websockets
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import (
@@ -38,6 +39,17 @@ async def listen_tiktok_room(ws, username: str):
     gift_count = 0
     like_count = 0
     viewer_count: int | None = None
+    recent_signatures: dict[str, float] = {}
+
+    def is_duplicate(signature: str, window_sec: float = 2.0) -> bool:
+        now = time.monotonic()
+        expired = [k for k, ts in recent_signatures.items() if now - ts > window_sec]
+        for k in expired:
+            del recent_signatures[k]
+        if signature in recent_signatures:
+            return True
+        recent_signatures[signature] = now
+        return False
 
     async def push_stats():
         await send_json(ws, {
@@ -53,7 +65,7 @@ async def listen_tiktok_room(ws, username: str):
     async def on_connect(event: ConnectEvent):
         await send_json(ws, {
             "type": "status",
-            "message": f"@{username} yayınına bağlandı, tüm olaylar dinleniyor...",
+            "message": f"@{username} yayınına bağlandı • Canlı akış aktif",
         })
         await push_stats()
 
@@ -61,7 +73,7 @@ async def listen_tiktok_room(ws, username: str):
     async def on_disconnect(event: DisconnectEvent):
         await send_json(ws, {
             "type": "status",
-            "message": f"@{username} yayın bağlantısı kapandı.",
+            "message": f"@{username} yayın bağlantısı sonlandı",
         })
 
     @client.on(RoomUserSeqEvent)
@@ -79,12 +91,15 @@ async def listen_tiktok_room(ws, username: str):
         if not comment_text:
             return
 
-        user_name = extract_username(getattr(event, "user", None))
-        comment_count += 1
+        user_name = str(extract_username(getattr(event, "user", None)))
+        sig = f"chat:{user_name}:{comment_text}"
+        if is_duplicate(sig, window_sec=2.5):
+            return
 
+        comment_count += 1
         await send_json(ws, {
             "type": "chat",
-            "user": str(user_name),
+            "user": user_name,
             "comment": comment_text,
         })
         await push_stats()
@@ -92,38 +107,42 @@ async def listen_tiktok_room(ws, username: str):
     @client.on(GiftEvent)
     async def on_gift(event: GiftEvent):
         nonlocal gift_count
-        # Seri hediyelerde (streak) yalnızca tamamlandığında saymak isterseniz:
         repeat_end = getattr(event, "repeat_end", None)
         streakable = bool(getattr(getattr(event, "gift", None), "streakable", False))
         if streakable and repeat_end is False:
             return
 
-        user_name = extract_username(getattr(event, "user", None))
+        user_name = str(extract_username(getattr(event, "user", None)))
         repeat_count = getattr(event, "repeat_count", None)
         count = repeat_count if isinstance(repeat_count, int) and repeat_count > 0 else 1
 
         gift_obj = getattr(event, "gift", None)
-        gift_name = (
+        gift_name = str(
             getattr(gift_obj, "name", None)
             or getattr(event, "gift_name", None)
             or "Hediye"
         )
         diamonds = getattr(gift_obj, "diamond_count", None)
+        diamond_val = diamonds if isinstance(diamonds, int) and diamonds > 0 else None
+
+        sig = f"gift:{user_name}:{gift_name}:{count}"
+        if is_duplicate(sig, window_sec=2.0):
+            return
 
         gift_count += count
         await send_json(ws, {
             "type": "gift",
-            "user": str(user_name),
-            "giftName": str(gift_name),
+            "user": user_name,
+            "giftName": gift_name,
             "count": count,
-            "diamonds": diamonds if isinstance(diamonds, int) else None,
+            "diamonds": diamond_val,
         })
         await push_stats()
 
     @client.on(LikeEvent)
     async def on_like(event: LikeEvent):
         nonlocal like_count
-        user_name = extract_username(getattr(event, "user", None))
+        user_name = str(extract_username(getattr(event, "user", None)))
         raw_count = getattr(event, "count", None)
         added = raw_count if isinstance(raw_count, int) and raw_count > 0 else 1
 
@@ -132,7 +151,7 @@ async def listen_tiktok_room(ws, username: str):
 
         await send_json(ws, {
             "type": "like",
-            "user": str(user_name),
+            "user": user_name,
             "count": added,
             "totalLikes": total_room_likes if isinstance(total_room_likes, int) else like_count,
         })
@@ -140,22 +159,26 @@ async def listen_tiktok_room(ws, username: str):
 
     @client.on(JoinEvent)
     async def on_join(event: JoinEvent):
-        user_name = extract_username(getattr(event, "user", None))
+        user_name = str(extract_username(getattr(event, "user", None)))
+        sig = f"join:{user_name}"
+        if is_duplicate(sig, window_sec=5.0):
+            return
+
         await send_json(ws, {
             "type": "join",
-            "user": str(user_name),
+            "user": user_name,
         })
 
     try:
         await send_json(ws, {
             "type": "status",
-            "message": f"@{username} canlı yayınına bağlanılıyor...",
+            "message": f"@{username} yayınına bağlanılıyor...",
         })
         await client.start()
     except asyncio.CancelledError:
         await send_json(ws, {
             "type": "status",
-            "message": f"@{username} dinlemesi durduruldu.",
+            "message": f"@{username} dinlemesi durduruldu",
         })
         raise
     except Exception as e:
@@ -212,7 +235,7 @@ async def ws_handler(websocket):
                 await cancel_current_task()
                 await send_json(websocket, {
                     "type": "status",
-                    "message": "Dinleme durduruldu.",
+                    "message": "Dinleme durduruldu",
                 })
 
             else:
@@ -235,4 +258,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                        
+    
