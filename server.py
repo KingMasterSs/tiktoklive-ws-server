@@ -25,29 +25,74 @@ def extract_username(user_obj) -> str:
     )
 
 
-def extract_viewer_counts_from_room_event(event: RoomUserSeqEvent) -> tuple[int | None, int | None]:
-    live_candidates = [
-        getattr(event, "viewer_count", None),
-        getattr(event, "viewerCount", None),
-    ]
-    total_candidates = [
-        getattr(event, "total_user", None),
-        getattr(event, "totalUser", None),
-    ]
-
-    live_val = next((v for v in live_candidates if isinstance(v, int) and v >= 0), None)
-    total_val = next((v for v in total_candidates if isinstance(v, int) and v >= 0), None)
-    return live_val, total_val
-
-
-def extract_live_from_client(client: TikTokLiveClient) -> int | None:
-    room_info = getattr(client, "room_info", None)
-    if isinstance(room_info, dict):
-        for k in ("user_count", "viewer_count", "total_user"):
-            val = room_info.get(k)
+def _find_int_field(obj, names: list[str]) -> int | None:
+    if obj is None:
+        return None
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            val = obj[name]
+            if isinstance(val, int) and val >= 0:
+                return val
+        else:
+            val = getattr(obj, name, None)
             if isinstance(val, int) and val >= 0:
                 return val
     return None
+
+
+def extract_viewer_counts_from_room_event(event: RoomUserSeqEvent) -> tuple[int | None, int | None]:
+    live_names = [
+        "viewer_count",
+        "viewerCount",
+        "online_user_count",
+        "onlineUserCount",
+        "current_viewer_count",
+    ]
+    total_names = [
+        "total_user",
+        "totalUser",
+        "total_viewer_count",
+        "totalViewerCount",
+    ]
+
+    live_val = _find_int_field(event, live_names)
+    total_val = _find_int_field(event, total_names)
+
+    # Bazı sürümlerde alanlar iç içe bir alt nesne altında bulunabilir
+    for attr in ("data", "room_user_seq", "payload", "raw"):
+        nested = getattr(event, attr, None)
+        if nested is not None:
+            if live_val is None:
+                live_val = _find_int_field(nested, live_names)
+            if total_val is None:
+                total_val = _find_int_field(nested, total_names)
+
+    if live_val is None and total_val is None:
+        try:
+            print("RoomUserSeqEvent debug:", getattr(event, "__dict__", str(event)), flush=True)
+        except Exception:
+            pass
+
+    return live_val, total_val
+
+
+def extract_live_from_client(client: TikTokLiveClient) -> tuple[int | None, int | None]:
+    room_info = getattr(client, "room_info", None)
+    live_val = None
+    total_val = None
+
+    if isinstance(room_info, dict):
+        live_val = _find_int_field(room_info, ["user_count", "viewer_count", "viewerCount"])
+        total_val = _find_int_field(room_info, ["total_user", "totalUser"])
+
+        data_obj = room_info.get("data")
+        if isinstance(data_obj, dict):
+            if live_val is None:
+                live_val = _find_int_field(data_obj, ["user_count", "viewer_count", "viewerCount"])
+            if total_val is None:
+                total_val = _find_int_field(data_obj, ["total_user", "totalUser"])
+
+    return live_val, total_val
 
 
 async def send_json(ws, payload: dict):
@@ -79,11 +124,12 @@ async def listen_tiktok_room(ws, username: str):
         return False
 
     async def push_stats():
-        nonlocal viewer_count
-        if viewer_count is None:
-            client_live = extract_live_from_client(client)
-            if client_live is not None:
-                viewer_count = client_live
+        nonlocal viewer_count, total_room_viewers
+        c_live, c_total = extract_live_from_client(client)
+        if c_live is not None:
+            viewer_count = c_live
+        if c_total is not None and total_room_viewers is None:
+            total_room_viewers = c_total
 
         await send_json(ws, {
             "type": "stats",
