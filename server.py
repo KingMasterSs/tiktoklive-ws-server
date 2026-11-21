@@ -14,6 +14,16 @@ from TikTokLive.events import (
     RoomUserSeqEvent,
 )
 
+try:
+    from TikTokLive.events import FollowEvent  # type: ignore
+except Exception:
+    FollowEvent = None
+
+try:
+    from TikTokLive.events import ShareEvent  # type: ignore
+except Exception:
+    ShareEvent = None
+
 
 def extract_username(user_obj) -> str:
     if not user_obj:
@@ -58,7 +68,6 @@ def extract_viewer_counts_from_room_event(event: RoomUserSeqEvent) -> tuple[int 
     live_val = _find_int_field(event, live_names)
     total_val = _find_int_field(event, total_names)
 
-    # Bazı sürümlerde alanlar iç içe bir alt nesne altında bulunabilir
     for attr in ("data", "room_user_seq", "payload", "raw"):
         nested = getattr(event, attr, None)
         if nested is not None:
@@ -66,12 +75,6 @@ def extract_viewer_counts_from_room_event(event: RoomUserSeqEvent) -> tuple[int 
                 live_val = _find_int_field(nested, live_names)
             if total_val is None:
                 total_val = _find_int_field(nested, total_names)
-
-    if live_val is None and total_val is None:
-        try:
-            print("RoomUserSeqEvent debug:", getattr(event, "__dict__", str(event)), flush=True)
-        except Exception:
-            pass
 
     return live_val, total_val
 
@@ -109,9 +112,12 @@ async def listen_tiktok_room(ws, username: str):
     gift_count = 0
     like_count = 0
     join_count = 0
+    follow_count = 0
+    share_count = 0
     viewer_count: int | None = None
     total_room_viewers: int | None = None
     recent_signatures: dict[str, float] = {}
+    stop_event = asyncio.Event()
 
     def is_duplicate(signature: str, window_sec: float = 2.0) -> bool:
         now = time.monotonic()
@@ -138,9 +144,19 @@ async def listen_tiktok_room(ws, username: str):
             "giftCount": gift_count,
             "likeCount": like_count,
             "joinCount": join_count,
+            "followCount": follow_count,
+            "shareCount": share_count,
             "viewerCount": viewer_count,
             "totalViewers": total_room_viewers,
         })
+
+    async def heartbeat_loop():
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=15.0)
+                break
+            except asyncio.TimeoutError:
+                await push_stats()
 
     @client.on(ConnectEvent)
     async def on_connect(event: ConnectEvent):
@@ -259,6 +275,40 @@ async def listen_tiktok_room(ws, username: str):
         })
         await push_stats()
 
+    if FollowEvent is not None:
+        @client.on(FollowEvent)
+        async def on_follow(event):
+            nonlocal follow_count
+            user_name = str(extract_username(getattr(event, "user", None)))
+            sig = f"follow:{user_name}"
+            if is_duplicate(sig, window_sec=5.0):
+                return
+            follow_count += 1
+            await send_json(ws, {
+                "type": "follow",
+                "user": user_name,
+                "followCount": follow_count,
+            })
+            await push_stats()
+
+    if ShareEvent is not None:
+        @client.on(ShareEvent)
+        async def on_share(event):
+            nonlocal share_count
+            user_name = str(extract_username(getattr(event, "user", None)))
+            sig = f"share:{user_name}"
+            if is_duplicate(sig, window_sec=3.0):
+                return
+            share_count += 1
+            await send_json(ws, {
+                "type": "share",
+                "user": user_name,
+                "shareCount": share_count,
+            })
+            await push_stats()
+
+    hb_task = asyncio.create_task(heartbeat_loop())
+
     try:
         await send_json(ws, {
             "type": "status",
@@ -277,6 +327,12 @@ async def listen_tiktok_room(ws, username: str):
             "message": f"TikTok bağlantısı başarısız: {str(e)}",
         })
     finally:
+        stop_event.set()
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
         try:
             await client.disconnect()
         except Exception:
