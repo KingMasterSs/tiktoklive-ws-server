@@ -40,6 +40,16 @@ def extract_viewer_counts_from_room_event(event: RoomUserSeqEvent) -> tuple[int 
     return live_val, total_val
 
 
+def extract_live_from_client(client: TikTokLiveClient) -> int | None:
+    room_info = getattr(client, "room_info", None)
+    if isinstance(room_info, dict):
+        for k in ("user_count", "viewer_count", "total_user"):
+            val = room_info.get(k)
+            if isinstance(val, int) and val >= 0:
+                return val
+    return None
+
+
 async def send_json(ws, payload: dict):
     try:
         await ws.send(json.dumps(payload, ensure_ascii=False))
@@ -69,6 +79,12 @@ async def listen_tiktok_room(ws, username: str):
         return False
 
     async def push_stats():
+        nonlocal viewer_count
+        if viewer_count is None:
+            client_live = extract_live_from_client(client)
+            if client_live is not None:
+                viewer_count = client_live
+
         await send_json(ws, {
             "type": "stats",
             "username": username,
