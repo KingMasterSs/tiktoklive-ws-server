@@ -25,17 +25,19 @@ def extract_username(user_obj) -> str:
     )
 
 
-def extract_viewer_count_from_room_event(event: RoomUserSeqEvent) -> int | None:
-    candidates = [
+def extract_viewer_counts_from_room_event(event: RoomUserSeqEvent) -> tuple[int | None, int | None]:
+    live_candidates = [
         getattr(event, "viewer_count", None),
         getattr(event, "viewerCount", None),
+    ]
+    total_candidates = [
         getattr(event, "total_user", None),
         getattr(event, "totalUser", None),
     ]
-    for val in candidates:
-        if isinstance(val, int) and val >= 0:
-            return val
-    return None
+
+    live_val = next((v for v in live_candidates if isinstance(v, int) and v >= 0), None)
+    total_val = next((v for v in total_candidates if isinstance(v, int) and v >= 0), None)
+    return live_val, total_val
 
 
 async def send_json(ws, payload: dict):
@@ -51,7 +53,9 @@ async def listen_tiktok_room(ws, username: str):
     comment_count = 0
     gift_count = 0
     like_count = 0
+    join_count = 0
     viewer_count: int | None = None
+    total_room_viewers: int | None = None
     recent_signatures: dict[str, float] = {}
 
     def is_duplicate(signature: str, window_sec: float = 2.0) -> bool:
@@ -71,7 +75,9 @@ async def listen_tiktok_room(ws, username: str):
             "commentCount": comment_count,
             "giftCount": gift_count,
             "likeCount": like_count,
+            "joinCount": join_count,
             "viewerCount": viewer_count,
+            "totalViewers": total_room_viewers,
         })
 
     @client.on(ConnectEvent)
@@ -91,10 +97,16 @@ async def listen_tiktok_room(ws, username: str):
 
     @client.on(RoomUserSeqEvent)
     async def on_room_stats(event: RoomUserSeqEvent):
-        nonlocal viewer_count
-        found = extract_viewer_count_from_room_event(event)
-        if found is not None:
-            viewer_count = found
+        nonlocal viewer_count, total_room_viewers
+        live_val, total_val = extract_viewer_counts_from_room_event(event)
+        updated = False
+        if live_val is not None:
+            viewer_count = live_val
+            updated = True
+        if total_val is not None:
+            total_room_viewers = total_val
+            updated = True
+        if updated:
             await push_stats()
 
     @client.on(CommentEvent)
@@ -172,15 +184,18 @@ async def listen_tiktok_room(ws, username: str):
 
     @client.on(JoinEvent)
     async def on_join(event: JoinEvent):
+        nonlocal join_count
         user_name = str(extract_username(getattr(event, "user", None)))
         sig = f"join:{user_name}"
         if is_duplicate(sig, window_sec=5.0):
             return
 
+        join_count += 1
         await send_json(ws, {
             "type": "join",
             "user": user_name,
         })
+        await push_stats()
 
     try:
         await send_json(ws, {
@@ -271,4 +286,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
